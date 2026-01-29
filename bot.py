@@ -14,7 +14,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Token do bot - Render vai pegar da variável de ambiente
-BOT_TOKEN = os.getenv('BOT_TOKEN', '8421702557:AAG-o6kUbmuxoUoYxq59qP9OrPbGuQCLmPE')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN não configurado! Configure nas variáveis de ambiente do Render.")
