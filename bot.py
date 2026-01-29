@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import logging
 import aiohttp
@@ -13,15 +14,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Token do bot - Render vai pegar da variável de ambiente
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+# Token do bot - LEITURA SEGURA DA VARIÁVEL DE AMBIENTE
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
+# Verificação de segurança
 if not BOT_TOKEN:
-    logger.error("BOT_TOKEN não configurado! Configure nas variáveis de ambiente do Render.")
-    exit(1)
+    logger.error("❌ ERRO CRÍTICO: BOT_TOKEN não encontrado!")
+    logger.error("Configure a variável de ambiente BOT_TOKEN no Railway:")
+    logger.error("1. Vá em 'Variables'")
+    logger.error("2. Adicione: BOT_TOKEN = seu_token_do_botfather")
+    sys.exit(1)
+
+if BOT_TOKEN == 'SEU_TOKEN_AQUI':
+    logger.error("❌ ERRO: Token padrão detectado!")
+    logger.error("Você precisa configurar o BOT_TOKEN nas variáveis do Railway")
+    sys.exit(1)
+
+logger.info("✅ Token carregado com sucesso!")
+
+# URLs das APIs
+TIKWM_API = 'https://www.tikwm.com/api/'
+SHOPEE_API = 'https://www.tikwm.com/api/shopee/video'
 
 class VideoDownloader:
-    """Classe para gerenciar downloads de vídeos"""
+    """Classe para gerenciar downloads de vídeos do TikTok e Shopee"""
     
     def __init__(self):
         self.session = None
@@ -29,8 +45,7 @@ class VideoDownloader:
     async def get_session(self):
         """Retorna uma sessão aiohttp reutilizável"""
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=60)
-            self.session = aiohttp.ClientSession(timeout=timeout)
+            self.session = aiohttp.ClientSession()
         return self.session
     
     async def close(self):
@@ -70,19 +85,16 @@ class VideoDownloader:
         try:
             session = await self.get_session()
             
-            # API do TikWM - gratuita e sem autenticação
-            api_url = 'https://www.tikwm.com/api/'
+            # Faz requisição para a API do TikWM
             params = {'url': url, 'hd': 1}
-            
-            async with session.post(api_url, data=params) as response:
+            async with session.post(TIKWM_API, data=params) as response:
                 if response.status != 200:
-                    return None, f"Erro na API (status {response.status})"
+                    return None, "Erro ao acessar API do TikTok"
                 
                 data = await response.json()
                 
                 if data.get('code') != 0:
-                    msg = data.get('msg', 'Erro desconhecido')
-                    return None, f"Erro ao processar: {msg}"
+                    return None, "Não foi possível processar o vídeo do TikTok"
                 
                 video_data = data.get('data', {})
                 
@@ -99,7 +111,7 @@ class VideoDownloader:
                         
                         # Informações adicionais
                         info = {
-                            'title': video_data.get('title', '')[:100],
+                            'title': video_data.get('title', ''),
                             'author': video_data.get('author', {}).get('unique_id', ''),
                             'duration': video_data.get('duration', 0),
                             'size': len(video_bytes)
@@ -107,11 +119,8 @@ class VideoDownloader:
                         
                         return video_bytes, info
                     else:
-                        return None, f"Erro ao baixar vídeo (status {video_response.status})"
+                        return None, "Erro ao baixar o vídeo"
         
-        except asyncio.TimeoutError:
-            logger.error("Timeout ao baixar TikTok")
-            return None, "Tempo esgotado. Tente novamente."
         except Exception as e:
             logger.error(f"Erro ao baixar TikTok: {e}")
             return None, f"Erro: {str(e)}"
@@ -121,11 +130,11 @@ class VideoDownloader:
         try:
             session = await self.get_session()
             
-            # API do TikWM para Shopee
-            api_url = 'https://www.tikwm.com/api/shopee/video'
+            # Tenta diferentes endpoints da API
             params = {'url': url}
             
-            async with session.post(api_url, data=params) as response:
+            # Primeira tentativa com API do TikWM (suporta Shopee)
+            async with session.post(SHOPEE_API, data=params) as response:
                 if response.status == 200:
                     data = await response.json()
                     
@@ -146,12 +155,35 @@ class VideoDownloader:
                                     
                                     return video_bytes, info
             
-            # Método alternativo se a API falhar
-            return None, "Não foi possível baixar o vídeo do Shopee. Verifique se o link está correto."
+            # Método alternativo: extrair diretamente do HTML
+            async with session.get(url) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    
+                    # Procura por URLs de vídeo no HTML
+                    video_patterns = [
+                        r'"(https?://[^"]+\.mp4[^"]*)"',
+                        r'videoUrl["\']:\s*["\']([^"\']+)["\']',
+                    ]
+                    
+                    for pattern in video_patterns:
+                        matches = re.findall(pattern, html)
+                        if matches:
+                            video_url = matches[0]
+                            
+                            async with session.get(video_url) as video_response:
+                                if video_response.status == 200:
+                                    video_bytes = await video_response.read()
+                                    
+                                    info = {
+                                        'title': 'Vídeo Shopee',
+                                        'size': len(video_bytes)
+                                    }
+                                    
+                                    return video_bytes, info
+            
+            return None, "Não foi possível baixar o vídeo do Shopee"
         
-        except asyncio.TimeoutError:
-            logger.error("Timeout ao baixar Shopee")
-            return None, "Tempo esgotado. Tente novamente."
         except Exception as e:
             logger.error(f"Erro ao baixar Shopee: {e}")
             return None, f"Erro: {str(e)}"
@@ -164,29 +196,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = """
 🎥 *Bot de Download de Vídeos*
 
-Bem-vindo! Eu baixo vídeos do *TikTok* e *Shopee* sem marca d'água!
+Bem-vindo! Eu posso baixar vídeos do *TikTok* e *Shopee* sem marca d'água!
 
 📝 *Como usar:*
-1️⃣ Envie o link do vídeo
+1️⃣ Envie o link do vídeo do TikTok ou Shopee
 2️⃣ Aguarde o processamento
-3️⃣ Receba o vídeo limpo!
+3️⃣ Receba o vídeo sem marca d'água!
 
-🔗 *Plataformas:*
+🔗 *Plataformas suportadas:*
 • TikTok (todos os links)
-• Shopee Video
+• Shopee Video (produtos e reviews)
 
 ⚡ *Recursos:*
-✓ Download em HD
-✓ Remove marcas d'água
-✓ Remove legendas e metadados
-✓ Pronto para repostar
+• Download em alta qualidade (HD quando disponível)
+• Remove marcas d'água automaticamente
+• Remove metadados e legendas
+• Vídeos prontos para repostar
 
 💡 *Dica para afiliados:*
-Salve vídeos de produtos e reposte sem o @ do criador original!
+Perfeito para salvar vídeos de produtos e repostar nas suas redes sociais sem o @ do criador original!
 
 📌 *Comandos:*
-/start - Boas-vindas
-/help - Ajuda
+/start - Mensagem de boas-vindas
+/help - Ajuda e instruções
 
 Envie um link para começar! 🚀
 """
@@ -201,30 +233,32 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 1. Abra o vídeo no TikTok
 2. Toque em "Compartilhar"
 3. Selecione "Copiar link"
-4. Cole aqui no chat
+4. Cole o link aqui no chat
 
 *Para Shopee:*
 1. Abra o produto com vídeo
 2. Toque em "Compartilhar"
 3. Copie o link
-4. Cole aqui no chat
+4. Cole o link aqui no chat
 
 *Formatos aceitos:*
 • https://www.tiktok.com/@user/video/123...
-• https://vm.tiktok.com/abc...
-• https://shopee.com.br/produto...
-• https://shp.ee/abc...
+• https://vm.tiktok.com/abc123/
+• https://shopee.com.br/product...
+• https://shp.ee/abc123
 
 *Limitações:*
 • Vídeos privados não podem ser baixados
-• Vídeos muito longos demoram mais
-• Respeite os direitos autorais
+• Vídeos muito longos podem demorar mais
+• Respeite os direitos autorais do conteúdo
 
 *Problemas?*
-Verifique se:
-✓ O link está correto
-✓ O vídeo é público
-✓ O link não expirou
+Se um vídeo não baixar, verifique:
+✓ O link está correto?
+✓ O vídeo é público?
+✓ O link não expirou?
+
+*Suporte:* Entre em contato com o desenvolvedor para reportar problemas.
 """
     await update.message.reply_text(help_message, parse_mode='Markdown')
 
@@ -232,13 +266,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processa mensagens com links"""
     text = update.message.text
     
-    # Verifica TikTok
+    # Verifica se tem link do TikTok
     tiktok_url = downloader.extract_tiktok_url(text)
     if tiktok_url:
         await process_tiktok(update, tiktok_url)
         return
     
-    # Verifica Shopee
+    # Verifica se tem link do Shopee
     shopee_url = downloader.extract_shopee_url(text)
     if shopee_url:
         await process_shopee(update, shopee_url)
@@ -283,9 +317,7 @@ async def process_tiktok(update: Update, url: str):
             video=video_bytes,
             caption=caption,
             parse_mode='Markdown',
-            supports_streaming=True,
-            read_timeout=60,
-            write_timeout=60
+            supports_streaming=True
         )
         
         await status_msg.delete()
@@ -293,7 +325,7 @@ async def process_tiktok(update: Update, url: str):
     except Exception as e:
         logger.error(f"Erro ao processar TikTok: {e}")
         await status_msg.edit_text(
-            f"❌ Erro ao processar vídeo.\n\n"
+            f"❌ Erro ao processar vídeo: {str(e)}\n\n"
             "Tente novamente ou use outro link."
         )
 
@@ -324,9 +356,7 @@ async def process_shopee(update: Update, url: str):
             video=video_bytes,
             caption=caption,
             parse_mode='Markdown',
-            supports_streaming=True,
-            read_timeout=60,
-            write_timeout=60
+            supports_streaming=True
         )
         
         await status_msg.delete()
@@ -334,7 +364,7 @@ async def process_shopee(update: Update, url: str):
     except Exception as e:
         logger.error(f"Erro ao processar Shopee: {e}")
         await status_msg.edit_text(
-            f"❌ Erro ao processar vídeo.\n\n"
+            f"❌ Erro ao processar vídeo: {str(e)}\n\n"
             "Tente novamente ou use outro link."
         )
 
@@ -342,8 +372,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processa vídeos enviados diretamente"""
     await update.message.reply_text(
         "📹 Você enviou um vídeo!\n\n"
-        "Para remover marca d'água, eu preciso do *link* do vídeo.\n\n"
-        "Por favor, envie o link do TikTok ou Shopee.",
+        "Para remover marca d'água, eu preciso do *link* do vídeo do TikTok ou Shopee.\n\n"
+        "Por favor, envie o link do vídeo ao invés do arquivo.",
         parse_mode='Markdown'
     )
 
@@ -354,7 +384,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update and update.message:
         await update.message.reply_text(
             "❌ Ocorreu um erro inesperado.\n"
-            "Por favor, tente novamente."
+            "Por favor, tente novamente mais tarde."
         )
 
 async def shutdown(application):
@@ -363,8 +393,8 @@ async def shutdown(application):
 
 def main():
     """Função principal"""
-    logger.info("🚀 Iniciando bot no Render.com...")
-    logger.info(f"Token configurado: {'Sim' if BOT_TOKEN else 'Não'}")
+    logger.info("🚀 Iniciando bot de download de vídeos...")
+    logger.info(f"📍 Rodando no Railway.app")
     
     # Cria a aplicação
     application = Application.builder().token(BOT_TOKEN).build()
@@ -380,7 +410,7 @@ def main():
     application.post_shutdown = shutdown
     
     # Inicia o bot
-    logger.info("✅ Bot iniciado com sucesso!")
+    logger.info("🤖 Bot iniciado! Pressione Ctrl+C para parar.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
