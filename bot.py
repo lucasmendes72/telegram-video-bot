@@ -4,6 +4,7 @@ import re
 import logging
 import aiohttp
 import asyncio
+import json
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -25,16 +26,10 @@ if not BOT_TOKEN:
     logger.error("2. Adicione: BOT_TOKEN = seu_token_do_botfather")
     sys.exit(1)
 
-if BOT_TOKEN == 'SEU_TOKEN_AQUI':
-    logger.error("❌ ERRO: Token padrão detectado!")
-    logger.error("Você precisa configurar o BOT_TOKEN nas variáveis do Railway")
-    sys.exit(1)
-
 logger.info("✅ Token carregado com sucesso!")
 
 # URLs das APIs
 TIKWM_API = 'https://www.tikwm.com/api/'
-SHOPEE_API = 'https://www.tikwm.com/api/shopee/video'
 
 class VideoDownloader:
     """Classe para gerenciar downloads de vídeos do TikTok e Shopee"""
@@ -45,7 +40,8 @@ class VideoDownloader:
     async def get_session(self):
         """Retorna uma sessão aiohttp reutilizável"""
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=60)
+            self.session = aiohttp.ClientSession(timeout=timeout)
         return self.session
     
     async def close(self):
@@ -127,45 +123,132 @@ class VideoDownloader:
             logger.error(f"Erro ao baixar TikTok: {e}")
             return None, f"Erro: {str(e)}"
     
+    async def resolve_short_url(self, url):
+        """Resolve URLs curtas da Shopee (shp.ee, br.shp.ee)"""
+        try:
+            session = await self.get_session()
+            async with session.get(url, allow_redirects=True) as response:
+                return str(response.url)
+        except:
+            return url
+    
     async def download_shopee(self, url):
-        """Baixa vídeo do Shopee sem marca d'água"""
+        """Baixa vídeo do Shopee tentando obter versão sem marca d'água"""
         try:
             session = await self.get_session()
             
-            # Tenta diferentes endpoints da API
-            params = {'url': url}
+            # Resolve URLs curtas primeiro
+            if 'shp.ee' in url:
+                url = await self.resolve_short_url(url)
+                logger.info(f"URL resolvida: {url}")
             
-            # Primeira tentativa com API do TikWM (suporta Shopee)
-            async with session.post(SHOPEE_API, data=params) as response:
+            # Extrai item_id e shop_id da URL
+            item_match = re.search(r'[.-]i\.(\d+)\.(\d+)', url)
+            if not item_match:
+                return None, "Não foi possível extrair ID do produto da URL"
+            
+            shop_id = item_match.group(1)
+            item_id = item_match.group(2)
+            
+            logger.info(f"Shop ID: {shop_id}, Item ID: {item_id}")
+            
+            # Tenta API pública da Shopee (sem autenticação)
+            # Este endpoint é usado internamente pela Shopee
+            api_url = f"https://shopee.com.br/api/v4/item/get"
+            
+            params = {
+                'itemid': item_id,
+                'shopid': shop_id
+            }
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': url,
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+            
+            async with session.get(api_url, params=params, headers=headers) as response:
                 if response.status == 200:
                     data = await response.json()
                     
-                    if data.get('code') == 0:
-                        video_data = data.get('data', {})
-                        video_url = video_data.get('video_url') or video_data.get('url')
+                    item_data = data.get('data', {}).get('item', {})
+                    if not item_data:
+                        item_data = data.get('item', {})
+                    
+                    # Procura por vídeo nos dados
+                    video_info = item_data.get('video_info_list', [])
+                    if video_info and len(video_info) > 0:
+                        video_data = video_info[0]
+                        
+                        # Tenta diferentes campos de URL
+                        video_url = (
+                            video_data.get('default_format', {}).get('url') or
+                            video_data.get('url') or
+                            video_data.get('video_url')
+                        )
                         
                         if video_url:
+                            # Algumas vezes a URL vem sem protocolo
+                            if video_url.startswith('//'):
+                                video_url = 'https:' + video_url
+                            elif not video_url.startswith('http'):
+                                video_url = 'https://' + video_url
+                            
+                            logger.info(f"URL do vídeo encontrada: {video_url[:100]}...")
+                            
                             # Baixa o vídeo
-                            async with session.get(video_url) as video_response:
+                            async with session.get(video_url, headers=headers) as video_response:
                                 if video_response.status == 200:
                                     video_bytes = await video_response.read()
                                     
                                     info = {
-                                        'title': video_data.get('title', 'Vídeo Shopee'),
+                                        'title': item_data.get('name', 'Vídeo Shopee'),
                                         'size': len(video_bytes)
                                     }
                                     
                                     return video_bytes, info
             
-            # Método alternativo: extrair diretamente do HTML
-            async with session.get(url) as response:
+            # Se a API oficial não funcionou, tenta scraping do HTML
+            logger.info("Tentando método alternativo via HTML...")
+            
+            async with session.get(url, headers=headers) as response:
                 if response.status == 200:
                     html = await response.text()
                     
-                    # Procura por URLs de vídeo no HTML
+                    # Procura por dados JSON embutidos no HTML
+                    json_match = re.search(r'<script>window\.__INITIAL_STATE__=({.+?})</script>', html)
+                    if json_match:
+                        try:
+                            json_data = json.loads(json_match.group(1))
+                            
+                            # Navega pela estrutura para encontrar o vídeo
+                            item_data = json_data.get('item', {}).get('item', {})
+                            video_info = item_data.get('video_info_list', [])
+                            
+                            if video_info and len(video_info) > 0:
+                                video_url = video_info[0].get('default_format', {}).get('url')
+                                
+                                if video_url:
+                                    if video_url.startswith('//'):
+                                        video_url = 'https:' + video_url
+                                    
+                                    async with session.get(video_url, headers=headers) as video_response:
+                                        if video_response.status == 200:
+                                            video_bytes = await video_response.read()
+                                            
+                                            info = {
+                                                'title': item_data.get('name', 'Vídeo Shopee'),
+                                                'size': len(video_bytes)
+                                            }
+                                            
+                                            return video_bytes, info
+                        except json.JSONDecodeError:
+                            pass
+                    
+                    # Última tentativa: procura por URLs de vídeo diretamente no HTML
                     video_patterns = [
-                        r'"(https?://[^"]+\.mp4[^"]*)"',
-                        r'videoUrl["\']:\s*["\']([^"\']+)["\']',
+                        r'"video_url"\s*:\s*"([^"]+)"',
+                        r'"url"\s*:\s*"(https?://[^"]*\.mp4[^"]*)"',
                     ]
                     
                     for pattern in video_patterns:
@@ -173,7 +256,10 @@ class VideoDownloader:
                         if matches:
                             video_url = matches[0]
                             
-                            async with session.get(video_url) as video_response:
+                            if video_url.startswith('//'):
+                                video_url = 'https:' + video_url
+                            
+                            async with session.get(video_url, headers=headers) as video_response:
                                 if video_response.status == 200:
                                     video_bytes = await video_response.read()
                                     
@@ -184,11 +270,13 @@ class VideoDownloader:
                                     
                                     return video_bytes, info
             
-            return None, "Não foi possível baixar o vídeo do Shopee"
+            return None, ("⚠️ Não foi possível baixar o vídeo sem marca d'água.\n\n"
+                         "💡 A Shopee protege seus vídeos e pode ter marca d'água embutida.\n"
+                         "✅ Para vídeos 100% limpos, use TikTok!")
         
         except Exception as e:
             logger.error(f"Erro ao baixar Shopee: {e}")
-            return None, f"Erro: {str(e)}"
+            return None, f"Erro ao processar: {str(e)}"
 
 # Instância global do downloader
 downloader = VideoDownloader()
@@ -198,29 +286,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = """
 🎥 *Bot de Download de Vídeos*
 
-Bem-vindo! Eu posso baixar vídeos do *TikTok* e *Shopee* sem marca d'água!
+Bem-vindo! Eu posso baixar vídeos do *TikTok* e *Shopee*!
 
 📝 *Como usar:*
 1️⃣ Envie o link do vídeo do TikTok ou Shopee
 2️⃣ Aguarde o processamento
-3️⃣ Receba o vídeo sem marca d'água!
+3️⃣ Receba o vídeo!
 
 🔗 *Plataformas suportadas:*
-• TikTok (todos os links)
-• Shopee Video (produtos e reviews)
+✅ *TikTok* - Remove 100% das marcas d'água
+⚠️ *Shopee* - Melhor esforço (pode conter watermark)
 
-⚡ *Recursos:*
-• Download em alta qualidade (HD quando disponível)
-• Remove marcas d'água automaticamente
-• Remove metadados e legendas
-• Vídeos prontos para repostar
+⚡ *Sobre a Shopee:*
+A Shopee protege seus vídeos e alguns podem ter marca d'água incorporada. Faremos o melhor para obter a versão limpa, mas não é sempre possível.
 
 💡 *Dica para afiliados:*
-Perfeito para salvar vídeos de produtos e repostar nas suas redes sociais sem o @ do criador original!
+Para vídeos 100% sem marca d'água, use TikTok! É perfeito para repostar.
 
 📌 *Comandos:*
-/start - Mensagem de boas-vindas
-/help - Ajuda e instruções
+/start - Esta mensagem
+/help - Ajuda detalhada
 
 Envie um link para começar! 🚀
 """
@@ -237,30 +322,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 3. Selecione "Copiar link"
 4. Cole o link aqui no chat
 
+✅ *TikTok = 100% sem marca d'água!*
+
 *Para Shopee:*
 1. Abra o produto com vídeo
 2. Toque em "Compartilhar"
 3. Copie o link
 4. Cole o link aqui no chat
 
+⚠️ *Atenção Shopee:*
+A Shopee protege seus vídeos. Faremos o melhor para obter sem marca d'água, mas alguns podem ainda ter.
+
 *Formatos aceitos:*
-• https://www.tiktok.com/@user/video/123...
-• https://vm.tiktok.com/abc123/
-• https://shopee.com.br/product...
-• https://shp.ee/abc123
+• TikTok: todos os links
+• Shopee: br.shp.ee, shp.ee, shopee.com.br
 
-*Limitações:*
-• Vídeos privados não podem ser baixados
-• Vídeos muito longos podem demorar mais
-• Respeite os direitos autorais do conteúdo
-
-*Problemas?*
-Se um vídeo não baixar, verifique:
-✓ O link está correto?
-✓ O vídeo é público?
-✓ O link não expirou?
-
-*Suporte:* Entre em contato com o desenvolvedor para reportar problemas.
+*Suporte:* Entre em contato com o desenvolvedor.
 """
     await update.message.reply_text(help_message, parse_mode='Markdown')
 
@@ -333,14 +410,19 @@ async def process_tiktok(update: Update, url: str):
 
 async def process_shopee(update: Update, url: str):
     """Processa download do Shopee"""
-    status_msg = await update.message.reply_text("⏳ Processando vídeo do Shopee...")
+    status_msg = await update.message.reply_text(
+        "⏳ Processando vídeo do Shopee...\n\n"
+        "⚠️ *Nota:* A Shopee protege seus vídeos.\n"
+        "Tentando obter a melhor qualidade possível...",
+        parse_mode='Markdown'
+    )
     
     try:
         # Baixa o vídeo
         video_bytes, result = await downloader.download_shopee(url)
         
         if video_bytes is None:
-            await status_msg.edit_text(f"❌ {result}")
+            await status_msg.edit_text(f"❌ {result}", parse_mode='Markdown')
             return
         
         # Prepara informações
@@ -349,7 +431,7 @@ async def process_shopee(update: Update, url: str):
         
         caption = f"✅ *Vídeo do Shopee baixado!*\n\n"
         caption += f"📦 Tamanho: {size_mb:.2f} MB\n\n"
-        caption += "🛍 Vídeo sem marca d'água, perfeito para afiliados!"
+        caption += "🛍 Vídeo processado!"
         
         await status_msg.edit_text("📤 Enviando vídeo...")
         
@@ -367,15 +449,16 @@ async def process_shopee(update: Update, url: str):
         logger.error(f"Erro ao processar Shopee: {e}")
         await status_msg.edit_text(
             f"❌ Erro ao processar vídeo: {str(e)}\n\n"
-            "Tente novamente ou use outro link."
+            "💡 *Dica:* Para vídeos 100% limpos, use TikTok!",
+            parse_mode='Markdown'
         )
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processa vídeos enviados diretamente"""
     await update.message.reply_text(
         "📹 Você enviou um vídeo!\n\n"
-        "Para remover marca d'água, eu preciso do *link* do vídeo do TikTok ou Shopee.\n\n"
-        "Por favor, envie o link do vídeo ao invés do arquivo.",
+        "Para processar, eu preciso do *link* do vídeo do TikTok ou Shopee.\n\n"
+        "Por favor, envie o link ao invés do arquivo.",
         parse_mode='Markdown'
     )
 
@@ -386,7 +469,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update and update.message:
         await update.message.reply_text(
             "❌ Ocorreu um erro inesperado.\n"
-            "Por favor, tente novamente mais tarde."
+            "Por favor, tente novamente."
         )
 
 async def shutdown(application):
