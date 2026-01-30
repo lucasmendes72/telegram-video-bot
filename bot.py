@@ -68,17 +68,19 @@ class VideoDownloader:
         return None
     
     def extract_shopee_url(self, text):
-        """Extrai URL do Shopee do texto"""
-        patterns = [
-            r'https?://(?:shopee\.com\.br|shopee\.com\.mx|shopee\.cl|shopee\.co|shp\.ee)/[\w./-]+',
-            r'https?://(?:video|vod)\.shopee\.com\.br/[\w./-]+',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(0)
-        return None
+    """Extrai URL do Shopee do texto"""
+    patterns = [
+        r'https?://(?:www\.)?(?:br|mx|cl|co|id|ph|sg|my|th|tw|vn)\.shp\.ee/[\w?=&./-]+',
+        r'https?://(?:shopee\.com\.br|shopee\.com\.mx|shopee\.cl|shopee\.co)/[\w.?=&/-]+',
+        r'https?://shp\.ee/[\w?=&./-]+',
+        r'https?://(?:video|vod)\.shopee\.com\.br/[\w.?=&/-]+',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0)
+    return None
     
     async def download_tiktok(self, url):
         """Baixa vídeo do TikTok sem marca d'água"""
